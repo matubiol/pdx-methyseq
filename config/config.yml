@@ -1,0 +1,112 @@
+# =============================================================================
+# Project directories
+# =============================================================================
+proj:
+    ref_dir: "/path/to/references"           # Root of reference files (relative paths below are resolved here)
+    proj_dir: "/path/to/project"             # Results go to <proj_dir>/analysis
+    raw_dir: "/path/to/raw/fastq"            # Raw FASTQ files
+    containers_dir: "/path/to/containers"    # Root for the container images listed in `app`
+
+# =============================================================================
+# Containers (relative to containers_dir, absolute paths, or URIs such as docker://...)
+# =============================================================================
+app:
+    xengsort: "Xengsort_v.2.2.1.sif"
+    bsbolt: "BSBolt_v.1.6.0.sif"
+    qualimap: "QualiMap_v.2.3.sif"
+
+# =============================================================================
+# Environment modules (used with --use-envmodules / --sdm env-modules)
+# Adapt the names to your cluster (`module avail`).
+# =============================================================================
+modules:
+    samtools: "samtools"
+    r: ["R", "pandoc"]
+
+# =============================================================================
+# Xengsort configuration
+# =============================================================================
+# Reference FASTAs (relative to ref_dir). cDNA is only used when data_type = rnaseq.
+xeng_ref:
+    dna_human: "xengsort/Homo_sapiens.GRCh38.dna.toplevel.fa.gz"
+    cdna_human: "xengsort/Homo_sapiens.GRCh38.cdna.all.fa.gz"
+    dna_mouse: "xengsort/Mus_musculus.GRCm38.dna.toplevel.fa.gz"
+    cdna_mouse: "xengsort/Mus_musculus.GRCm38.cdna.all.fa.gz"
+
+# Index building
+xeng_index:
+    run: false
+    out_dir: "xengsort"            # Relative to ref_dir; index prefix = <out_dir>/xengsort-<data_type>-k<k>
+    data_type: wgbs                # Options: rnaseq, wes, wgbs
+    k: 25
+    size: 9000000000               # Keep in sync with k (k=25 -> 9e9)
+    fill: 0.88
+    weakthreads: 11
+    threads: 11
+    mem_mb: 64000
+
+# Read classification
+xeng_class:
+    run: true
+    # FASTQ patterns relative to raw_dir. Examples:
+    #   flat layout:          "{sample}_R1.fastq.gz"
+    #   per-sample subfolder: "{sample}/{sample}_1.fq.gz"
+    r1_pattern: "{sample}_R1.fastq.gz"
+    r2_pattern: "{sample}_R2.fastq.gz"
+    chunksize: 16.0
+    prefetch: 1
+    threads: 16
+    mem_mb: 128000
+    # Optional: explicit index prefix (relative to ref_dir) of an existing index.
+    # Leave empty to use <xeng_index.out_dir>/xengsort-<data_type>-k<k>.
+    index: ""
+
+# =============================================================================
+# BSBolt configuration
+# =============================================================================
+bsbolt_index:
+    run: false
+    ref_genome: "hg38/Homo_sapiens_assembly38.fasta"   # Relative to ref_dir
+    mem_mb: 48000
+
+bsbolt_call:
+    # Only used when xeng_class.run is false (reads already cleaned).
+    # in_dir defaults to raw_dir when empty.
+    in_dir: ""
+    r1_pattern: "{sample}_R1.fastq.gz"
+    r2_pattern: "{sample}_R2.fastq.gz"
+    discard: []                    # Samples to exclude, e.g. ["sampleA", "sampleB"]
+    index_dir: "hg38/BSBolt_index" # Relative to ref_dir (also the output of bsbolt_index)
+    thread_align: 24
+    mem_align: 64000
+    thread_qc: 8
+    mem_qc: 16000
+    thread_call: 16
+    mem_call: 32000
+
+bsbolt_matrix:
+    min_cov: 5
+    min_sample: 0.8                # Fraction of samples that must cover a CpG
+    window_size: 3000000           # kNN imputation window (bp)
+    kneighbors: 5
+    thread_agg: 16
+    mem_agg: 64000
+    thread_impute: 16
+    mem_impute: 64000
+
+# =============================================================================
+# Downstream analysis configuration
+# =============================================================================
+downstream:
+    metadata: "data/metadata.tsv"  # Relative to proj_dir (or absolute)
+    samples_col: "SampleID"        # Metadata column with sample IDs (must match FASTQ {sample})
+    batch_var: ""                  # Metadata column for ComBat; empty to skip
+    var: "KRAS"                    # Two-level metadata column for the differential analysis
+    test_group: "MUT"              # Level of `var` used as test group (diff = test - reference)
+    clust_k:                       # Empty = choose k by silhouette; integer to force k
+    gen_ver: "hg38"                # hg38 or hg19 (annotation)
+    dss_min_cov: 5                 # Min coverage per CpG in every sample for DSS
+    # chromosomes: ["chr1", "chr2"]  # Optional subset (default: chr1-22, chrX, chrY)
+    mem_cluster: 34000
+    mem_dss: 240000
+    mem_annot: 34000

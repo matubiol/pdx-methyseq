@@ -1,0 +1,155 @@
+'''
+PIPELINE: Xengsort + BSBolt workflow for methylation analysis of PDX samples
+DESCRIPTION:
+    Snakemake workflow for EM-seq / WGBS data from patient-derived xenografts (PDX).
+    Steps:
+    1. Xengsort index building (optional)
+    2. Xengsort human/mouse read classification (optional)
+    3. BSBolt index building (optional)
+    4. BSBolt alignment, deduplication, QC and methylation calling
+    5. BSBolt methylation matrix aggregation and kNN imputation
+    6. Downstream analysis: clustering, differential methylation (DSS), DMR annotation
+USAGE:
+    # Whole pipeline:
+        snakemake --configfile config/config.yml --profile <your_profile>
+    # Stop after the Xengsort QC (to inspect host contamination and fill `discard`):
+        snakemake --configfile config/config.yml --profile <your_profile> --until xengsort_multiqc
+'''
+
+# =============================================================================
+# GLOBAL CONFIGURATION
+# =============================================================================
+import os
+import re
+from pathlib import Path
+
+
+def resolve(base, path):
+    """Join `path` to `base` unless it is already absolute or a URI (docker://, oras://...)."""
+    path = str(path)
+    if path.startswith("/") or "://" in path:
+        return path
+    return str(Path(base) / path)
+
+
+# Project directories
+PROJ_DIR = config['proj']['proj_dir']
+REF_DIR = Path(config['proj']['ref_dir'])
+CONTAINERS_DIR = config['proj'].get('containers_dir') or "."
+OUT_DIR = f"{PROJ_DIR}/analysis"
+RAW_DIR = config['proj']['raw_dir']
+
+# Containers (paths relative to containers_dir, absolute paths or URIs)
+APP = {key: resolve(CONTAINERS_DIR, path) for key, path in config['app'].items()}
+
+# Sample discovery: raw FASTQs if Xengsort runs, otherwise the BSBolt input directory
+if config['xeng_class']['run']:
+    DISCOVERY_DIR = RAW_DIR
+    R1_PATTERN = config['xeng_class']['r1_pattern']
+    R2_PATTERN = config['xeng_class']['r2_pattern']
+else:
+    DISCOVERY_DIR = config['bsbolt_call'].get('in_dir') or RAW_DIR
+    R1_PATTERN = config['bsbolt_call']['r1_pattern']
+    R2_PATTERN = config['bsbolt_call']['r2_pattern']
+
+if not R1_PATTERN or not R2_PATTERN:
+    raise ValueError("r1_pattern / r2_pattern are empty for the active input step. Check the config.")
+
+SAMPLES = sorted(set(glob_wildcards(f"{DISCOVERY_DIR}/{R1_PATTERN}").sample))
+DISCARD = config['bsbolt_call'].get('discard') or []
+SAMPLES = [s for s in SAMPLES if s not in DISCARD]
+if not SAMPLES:
+    raise ValueError(
+        f"No samples found under {DISCOVERY_DIR} matching pattern '{R1_PATTERN}'. "
+        "Check raw_dir / in_dir / r1_pattern."
+    )
+
+wildcard_constraints:  # Restrict {sample} wildcard to real sample names
+    sample = "|".join(re.escape(s) for s in SAMPLES),
+
+# Xengsort configuration
+OUT_XENG = f"{OUT_DIR}/01_Xengsort"
+DATA_TYPE = config['xeng_index']['data_type']
+K_XENG = config['xeng_index']['k']
+if config['xeng_class'].get('index'):
+    # Explicit index prefix (relative to ref_dir), e.g. an index built outside this workflow
+    INDEX_XENG = resolve(REF_DIR, config['xeng_class']['index'])
+else:
+    INDEX_XENG = f"{REF_DIR}/{config['xeng_index']['out_dir']}/xengsort-{DATA_TYPE}-k{K_XENG}"
+INDEX_XENG_EXISTS = os.path.isfile(f"{INDEX_XENG}.info") and os.path.isfile(f"{INDEX_XENG}.hash")
+if config['xeng_class']['run'] and not config['xeng_index']['run'] and not INDEX_XENG_EXISTS:
+    raise ValueError(
+        f"xeng_index.run is False, but no Xengsort index was found at:\n"
+        f"    {INDEX_XENG}.info / .hash\n"
+        "Check xeng_class.index (or xeng_index.out_dir/data_type/k) for a possible typo, "
+        "or set xeng_index.run to True to build it."
+    )
+
+# BSBolt configuration
+INDEX_BS = f"{REF_DIR}/{config['bsbolt_call']['index_dir']}"
+INDEX_BS_EXISTS = os.path.isdir(INDEX_BS) and len(os.listdir(INDEX_BS)) > 0
+if not config["bsbolt_index"]["run"] and not INDEX_BS_EXISTS:
+    raise ValueError(
+        f"bsbolt_index.run is False, but no BSBolt index was found at:\n"
+        f"    {INDEX_BS}\n"
+        "Check bsbolt_call.index_dir in the config for a possible typo, "
+        "or set bsbolt_index.run to True to build it."
+    )
+if config['xeng_class']['run']:
+    IN_DIR = OUT_XENG
+    R1_BS = "{sample}/{sample}-graft.1.fq.gz"
+    R2_BS = "{sample}/{sample}-graft.2.fq.gz"
+    OUT_BS = f"{OUT_DIR}/02_BSBolt"
+else:
+    IN_DIR = DISCOVERY_DIR
+    R1_BS = R1_PATTERN
+    R2_BS = R2_PATTERN
+    OUT_BS = f"{OUT_DIR}/01_BSBolt"
+CALL_DIR = f"{OUT_BS}/03_CallMethylation"
+
+# Downstream analysis configuration
+METADATA = resolve(PROJ_DIR, config['downstream']['metadata'])
+OUT_DOWN = f"{OUT_DIR}/03_MethylAnalysis"
+K_CLUST = config['downstream'].get('clust_k') or "best"
+VAR = config['downstream']['var']
+TEST_GROUP = config['downstream']['test_group']
+CHROMOSOMES = config['downstream'].get('chromosomes') or \
+    [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
+
+# =============================================================================
+# TARGET RULE
+# =============================================================================
+final_outputs = [
+    f"{OUT_BS}/02_Align_QC/multiqc_report.html",
+    expand(f"{CALL_DIR}/{{sample}}/{{sample}}_meth.CGmap.gz", sample=SAMPLES),
+    f"{CALL_DIR}/methyl_matrix_imputed.tsv",
+    f"{OUT_DOWN}/01_Clustering/k_{K_CLUST}/adonis.txt",
+    f"{OUT_DOWN}/03_DMR_annotation/DMR_results_{VAR}_all_ann.csv",
+]
+
+if config["xeng_class"]["run"]:
+    if config["xeng_index"]["run"]:
+        final_outputs.extend([f"{INDEX_XENG}.info", f"{INDEX_XENG}.hash"])
+    final_outputs.extend([
+        expand(f"{OUT_XENG}/{{sample}}/{{sample}}-graft.{{read}}.fq.gz",
+               sample=SAMPLES, read=[1, 2]),
+        f"{OUT_XENG}/multiqc_report.html",
+    ])
+if config["bsbolt_index"]["run"]:
+    final_outputs.append(INDEX_BS)
+
+rule all:
+    input:
+        final_outputs
+
+# =============================================================================
+# MODULES
+# =============================================================================
+if config["xeng_index"]["run"]:
+    include: "rules/xengsort_index.smk"
+include: "rules/xengsort_class.smk"
+if config["bsbolt_index"]["run"]:
+    include: "rules/BSBolt_index.smk"
+include: "rules/BSBolt_AlignCall.smk"
+include: "rules/BSBolt_matrix.smk"
+include: "rules/MethylAnalysis.smk"
