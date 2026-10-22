@@ -68,7 +68,7 @@ R packages: `tidyverse`, `data.table`, `optparse`, `bsseq`, `DSS`, `PCAtools`, `
 ### 1. Clone the repository
 
 ```bash
-git clone <gitlab-url>/pdx-methylseq.git
+git clone https://github.com/matubiol/pdx-methyseq.git
 cd pdx-methylseq
 ```
 
